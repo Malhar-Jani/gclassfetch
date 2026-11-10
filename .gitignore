@@ -1,0 +1,40 @@
+# Google OAuth & API secrets - NEVER COMMIT THESE
+credentials.json
+token.json
+
+# Local user configurations & destination paths
+config.json
+dest.json
+
+# Downloaded files & temporary downloads
+downloads/
+Classroom/
+*.part
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project

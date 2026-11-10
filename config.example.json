@@ -1,0 +1,11 @@
+{
+  "dest": "",
+  "workers": 8,
+  "options": {
+    "include_materials": true,
+    "include_coursework": true,
+    "include_announcements": true,
+    "save_links": true,
+    "export_docs": true
+  }
+}
