@@ -47,7 +47,7 @@ function updateSelection() {
   $('selectAll').checked = visible.length > 0 && checked === visible.length;
   $('selectAll').indeterminate = checked > 0 && checked < visible.length;
   $('selectAll').disabled = !visible.length || running || starting;
-  $('selectionSummary').textContent = selected.size ? `${selected.size} course${selected.size === 1 ? '' : 's'} selected. Materials, assignments, and announcements follow your settings.` : 'Choose the courses you want to keep.';
+  $('selectionSummary').textContent = selected.size ? `${selected.size} course${selected.size === 1 ? '' : 's'} selected.` : 'Choose the courses you want to keep.';
   $('downloadButton').textContent = running ? 'Download in progress' : starting ? 'Starting download…' : selected.size ? `Download ${selected.size} course${selected.size === 1 ? '' : 's'}` : 'Choose courses to download';
   $('downloadButton').disabled = running || starting || loadingCourses || !selected.size || !configReady;
   document.querySelectorAll('.course-row').forEach(row => {

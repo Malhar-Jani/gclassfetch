@@ -162,19 +162,73 @@ class DownloadTests(unittest.TestCase):
         self.dl.list_folder = folder
         with patch.object(app, 'batch_metadata', side_effect=lambda api, ids, *args: {fid: metas[fid] for fid in ids}):
             result = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
-        self.assertEqual(len(result), 2)
-        self.assertTrue(any('Level 10' in str(item['dir']) for item in result))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['dir'], self.root / 'Course')
+        self.assertFalse(any(p.is_dir() for p in (self.root / 'Course').iterdir()))
         self.assertTrue(any('ancestor' in issue['reason'] for issue in app.state['issues']))
 
-    def test_same_title_posts_do_not_merge_and_text_does_not_repeat(self):
+    def test_repeated_attachments_save_once_and_post_text_is_aggregated(self):
         posts = [{'id': id, 'title': 'Lecture', 'description': 'Read this', 'materials': [{'driveFile': {'id': 'file'}}]} for id in ['p1', 'p2']]
         self.scan_setup(posts)
         with patch.object(app, 'batch_metadata', return_value={'file': self.item('file')['meta']}):
             first = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
             self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
-        self.assertEqual(len({item['dir'] for item in first}), 2)
-        for item in first:
-            self.assertEqual((item['dir'] / 'description.txt').read_text().count('Read this'), 1)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]['dir'], self.root / 'Course')
+        self.assertEqual((first[0]['dir'] / 'Classroom notes.txt').read_text().count('Read this'), 1)
+
+    def test_announcements_save_directly_in_course_without_id_folders(self):
+        classroom = self.scan_setup([])
+        classroom.courses.return_value.announcements.return_value.list.return_value.execute.return_value = {'announcements':[
+            {'id':'12345','creationTime':'2026-11-12T10:00:00Z','text':'Read chapter 1', 'materials':[{'driveFile':{'id':'a'}}]},
+            {'id':'67890','creationTime':'2026-11-13T10:00:00Z','text':'Read chapter 2', 'materials':[{'driveFile':{'id':'b'}}]}]}
+        with patch.object(app,'batch_metadata',return_value={'a':self.item('a')['meta'],'b':self.item('b')['meta']}):
+            result = self.dl.scan_course({'id':'c','name':'Course'},self.root)
+        self.assertEqual(len(result),2)
+        self.assertTrue(all(item['dir']==self.root/'Course' for item in result))
+        text=(self.root/'Course'/'Classroom announcements.txt').read_text()
+        self.assertIn('Read chapter 1',text)
+        self.assertIn('Read chapter 2',text)
+        self.assertFalse(any(p.is_dir() for p in (self.root/'Course').iterdir()))
+
+    def test_flatten_legacy_folders_preserves_files_and_repeat_download_records(self):
+        course=self.root/'Course'
+        old=course/'_announcements'/'2026-11-12 123456789'
+        old.mkdir(parents=True)
+        (old/'notes.pdf').write_bytes(b'old pdf')
+        (course/'notes.pdf').write_bytes(b'different pdf')
+        (old/'description.txt').write_text('Read this chapter',encoding='utf-8')
+        (old/'announcements.txt').write_text('Exam on Monday',encoding='utf-8')
+        (old/'links.txt').write_text('https://example.com',encoding='utf-8')
+        (old/'.gclassfetch.json').write_text(json.dumps({'a':{'filename':'notes.pdf','version':['v1'],'sha256':app.file_digest(old/'notes.pdf')}}),encoding='utf-8')
+        self.assertEqual(app.flatten_course_folder(course),1)
+        self.assertEqual((course/'notes.pdf').read_bytes(),b'different pdf')
+        self.assertEqual((course/'notes (1).pdf').read_bytes(),b'old pdf')
+        self.assertFalse((course/'_announcements').exists())
+        self.assertIn('Read this chapter',(course/'Classroom notes.txt').read_text())
+        self.assertIn('Exam on Monday',(course/'Classroom announcements.txt').read_text())
+        record=json.loads((course/'.gclassfetch.json').read_text())
+        self.assertEqual(record['a']['filename'],'notes (1).pdf')
+        archives=list((self.root/'.gclassfetch-backups').rglob('original-text.zip'))
+        self.assertEqual(len(archives),1)
+        with app.zipfile.ZipFile(archives[0]) as archive:
+            self.assertEqual(archive.read('_announcements/2026-11-12 123456789/description.txt'),b'Read this chapter')
+        self.assertEqual(app.flatten_course_folder(course),0)
+
+    def test_flatten_preserves_an_attachment_named_like_a_support_file(self):
+        course=self.root/'Course'; old=course/'Topic'/'Post';old.mkdir(parents=True)
+        (old/'links.txt').write_bytes(b'actual attachment')
+        (old/'.gclassfetch.json').write_text(json.dumps({'a':{'filename':'links.txt','sha256':app.file_digest(old/'links.txt')}}))
+        app.flatten_course_folder(course)
+        self.assertEqual((course/'links.txt').read_bytes(),b'actual attachment')
+
+    def test_cleanup_problem_does_not_prevent_finding_new_materials(self):
+        self.scan_setup([{'id':'p','title':'Notes','materials':[{'driveFile':{'id':'a'}}]}])
+        with patch.object(app,'flatten_course_folder',side_effect=OSError('Unfinished old download')), patch.object(app,'batch_metadata',return_value={'a':self.item()['meta']}):
+            result=self.dl.scan_course({'id':'c','name':'Course'},self.root)
+        self.assertEqual(len(result),1)
+        self.assertEqual(result[0]['dir'],self.root/'Course')
+        self.assertTrue(any('old folders' in issue['reason'] for issue in app.state['issues']))
 
     def test_metadata_and_scan_failures_are_visible(self):
         classroom = self.scan_setup([{'id': 'p', 'title': 'Notes', 'materials': [{'driveFile': {'id': 'missing'}}]}])

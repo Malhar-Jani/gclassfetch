@@ -10,6 +10,7 @@ import threading
 import time
 import webbrowser
 import uuid
+import zipfile
 import gclassfetch_ui
 from urllib.parse import parse_qs, unquote, urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -200,6 +201,150 @@ def file_digest(path, algorithm="sha256"):
     return digest.hexdigest()
 
 
+def hide_metadata(path):
+    """Keep the downloader's bookkeeping out of Windows Explorer's normal view."""
+    if sys.platform == "win32":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        kernel.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        kernel.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong]
+        attributes = kernel.GetFileAttributesW(str(path))
+        if attributes != -1:
+            kernel.SetFileAttributesW(str(path), attributes | 2)
+
+
+def flatten_course_folder(course_dir):
+    """Move legacy attachments into their course folder without overwriting files.
+
+    Back up merged text and manifests, and journal every attachment move. Only
+    empty directories are removed; distinct attachments always keep their bytes.
+    """
+    requested = Path(course_dir)
+    if requested.is_symlink() or getattr(requested, "is_junction", lambda: False)():
+        raise OSError("A linked course folder needs to be organized separately.")
+    course = requested.resolve()
+    if not course.is_dir():
+        return 0
+    nested = []
+    directories = []
+    for root, children, filenames in os.walk(course, followlinks=False):
+        for child in children[:]:
+            path = Path(root) / child
+            if child.startswith("."):
+                children.remove(child)
+                continue
+            if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                raise OSError("A linked folder needs to be organized separately.")
+            if not path.resolve().is_relative_to(course):
+                raise OSError("A folder points outside this course.")
+            directories.append(path)
+        for filename in filenames:
+            path = Path(root) / filename
+            if path.is_symlink() or not path.resolve().is_relative_to(course):
+                raise OSError("A file points outside this course.")
+            if path.parent != course:
+                if filename.endswith(".part"):
+                    raise OSError("An unfinished download is present. Finish it before organizing this course.")
+                nested.append(path)
+    if not directories:
+        return 0
+
+    manifests = {}
+    tracked = set()
+    for path in [course / ".gclassfetch.json"] + [p for p in nested if p.name == ".gclassfetch.json"]:
+        if not path.is_file():
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise OSError("The saved file record is damaged. Keep it for recovery before organizing this course.")
+        manifests[path] = data
+        for entry in data.values():
+            name = entry.get("filename", "")
+            if name and Path(name).name == name:
+                tracked.add(path.parent / name)
+
+    text_names = {"description.txt": "Classroom notes.txt",
+                  "announcements.txt": "Classroom announcements.txt",
+                  "links.txt": "Classroom links.txt"}
+    text_files = [p for p in nested if p.name in text_names and p not in tracked]
+    other_files = [p for p in nested if p not in text_files and p.name != ".gclassfetch.json"]
+    used = {p.name.casefold() for p in course.iterdir()} | {name.casefold() for name in text_names.values()}
+    mapping = {}
+    moves = []
+    for source in sorted(other_files):
+        name = source.name
+        counter = 1
+        while name.casefold() in used:
+            name = f"{source.stem} ({counter}){source.suffix}"
+            counter += 1
+        target = course / name
+        # Both absolute endpoints are checked before any file move.
+        if not source.resolve().is_relative_to(course) or target.resolve().parent != course:
+            raise OSError("A file move would leave this course folder.")
+        used.add(name.casefold())
+        mapping[source] = target
+        moves.append({"from": source.relative_to(course).as_posix(), "to": name,
+                      "sha256": file_digest(source)})
+
+    backup_root = course.parent / ".gclassfetch-backups"
+    backup_root.mkdir(exist_ok=True)
+    hide_metadata(backup_root)
+    backup = backup_root / (safe_name(course.name, 60) + "-" + uuid.uuid4().hex[:10])
+    backup.mkdir()
+    journal = backup / "moves.json"
+    journal.write_text(json.dumps({"course": str(course), "moves": moves}, indent=2), encoding="utf-8")
+    originals = set(text_files) | set(manifests)
+    originals.update(course / name for name in set(text_names.values()) if (course / name).is_file())
+    archive_path = backup / "original-text.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(originals):
+            archive.write(path, path.relative_to(course).as_posix())
+    with zipfile.ZipFile(archive_path) as archive:
+        for path in originals:
+            if archive.read(path.relative_to(course).as_posix()) != path.read_bytes():
+                raise OSError("The layout backup could not be verified.")
+
+    # Merge descriptions and announcements into one readable file per course.
+    for source in text_files:
+        target = course / text_names[source.name]
+        existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+        text = source.read_text(encoding="utf-8").strip()
+        if text and text not in existing:
+            target.write_text(existing.rstrip() + ("\n\n" if existing else "") + text + "\n", encoding="utf-8")
+        source.unlink()  # Verified original is kept in the backup ZIP.
+    for source, target in mapping.items():
+        os.rename(source, target)
+    for move in moves:
+        if file_digest(course / move["to"]) != move["sha256"]:
+            raise OSError("A moved file could not be verified. See the layout backup journal.")
+
+    merged = {}
+    for path, data in manifests.items():
+        for fid, entry in data.items():
+            source = path.parent / entry.get("filename", "")
+            target = mapping.get(source, source)
+            if target.parent != course or not target.is_file():
+                continue
+            entry = {**entry, "filename": target.name}
+            previous = merged.get(fid)
+            if previous is None or str(entry.get("version")) >= str(previous.get("version")):
+                merged[fid] = entry
+    if merged:
+        manifest = course / ".gclassfetch.json"
+        manifest.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+        hide_metadata(manifest)
+    for path in manifests:
+        if path.parent != course:
+            path.unlink()  # Original is preserved in the verified backup ZIP.
+    for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        try:
+            directory.rmdir()  # Never recursively delete a directory or its contents.
+        except OSError:
+            pass
+    log(f"Simplified {course.name}: {len(moves)} files moved into the course folder", "ok")
+    return len(moves)
+
+
 def explain_error(error):
     if isinstance(error, HttpError):
         status = error.resp.status
@@ -299,32 +444,21 @@ def generate_offline_index(dest_dir):
         for course_dir in sorted(dest.iterdir()):
             if not course_dir.is_dir() or course_dir.name.startswith("."):
                 continue
-            topics = []
-            course_total = 0
-            for topic_dir in sorted(course_dir.iterdir()):
-                if not topic_dir.is_dir() or topic_dir.name.startswith("."):
-                    continue
-                posts = {}
-                for root, directories, filenames in os.walk(topic_dir):
-                    directories[:] = sorted(d for d in directories if not d.startswith("."))
-                    for filename in sorted(filenames):
-                        if filename.startswith(".") or filename.endswith((".part", ".tmp")) or filename == "index.html":
-                            continue
-                        path = Path(root) / filename
-                        post_name = str(Path(root).relative_to(topic_dir))
-                        post_name = post_name if post_name != "." else "Files"
-                        posts.setdefault(post_name, []).append({
-                            "name": filename,
-                            "url": quote(path.relative_to(dest).as_posix(), safe="/"),
-                            "ext": path.suffix.lower().lstrip(".") or "file",
-                            "size": path.stat().st_size,
-                        })
-                        course_total += 1
-                if posts:
-                    topics.append({"name": topic_dir.name.replace("_announcements", "Announcements").replace("_course_materials", "Course materials"), "posts": posts})
-            if topics:
-                courses.append({"name": course_dir.name, "topics": topics, "count": course_total})
-                total += course_total
+            files = []
+            # Also read older nested layouts so existing libraries stay usable.
+            for root, directories, filenames in os.walk(course_dir):
+                directories[:] = sorted(d for d in directories if not d.startswith("."))
+                for filename in sorted(filenames):
+                    if filename.startswith(".") or filename.endswith((".part", ".tmp")) or filename == "index.html":
+                        continue
+                    path = Path(root) / filename
+                    files.append({"name": filename,
+                                  "url": quote(path.relative_to(dest).as_posix(), safe="/"),
+                                  "ext": path.suffix.lower().lstrip(".") or "file"})
+            if files:
+                files.sort(key=lambda file: file["name"].casefold())
+                courses.append({"name": course_dir.name, "files": files, "count": len(files)})
+                total += len(files)
         with app.app_context():
             page = render_template("library.html", courses=courses, total=total,
                                    css=(UI_BASE / "static" / "app.css").read_text(encoding="utf-8"))
@@ -502,6 +636,7 @@ class Downloader:
             temp = path.with_suffix(".tmp")
             temp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             os.replace(temp, path)
+            hide_metadata(path)
 
     def bump_bytes(self, n):
         with state_lock:
@@ -549,7 +684,7 @@ class Downloader:
             return
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            path = dest_dir / "links.txt"
+            path = dest_dir / "Classroom links.txt"
             line = f"[{kind.upper()}] {title} -> {url}\n"
             with self.file_lock:
                 existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -565,7 +700,7 @@ class Downloader:
             return
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            filepath = dest_dir / "announcements.txt"
+            filepath = dest_dir / "Classroom announcements.txt"
             date = item.get("creationTime", "")[:10]
             block = f"=== {date} ===\n{text}\n\n"
             existing = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
@@ -581,7 +716,7 @@ class Downloader:
             return
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            filepath = dest_dir / "description.txt"
+            filepath = dest_dir / "Classroom notes.txt"
             block = f"=== {title} ===\n{text}\n\n"
             existing = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
             if block not in existing:
@@ -619,35 +754,14 @@ class Downloader:
         cname = self.course_paths.get(cid, safe_name(name + section_part))
         cdir = base_dir / cname
 
-        topics = {}
-        used_topics = set()
         try:
-            for t in paginate(classroom.courses().topics().list, "topic", courseId=cid):
-                label = safe_name(t.get("name", "General / No Topic"))
-                if label.casefold() in used_topics:
-                    label += f" [{t['topicId']}]"
-                topics[t["topicId"]] = label
-                used_topics.add(label.casefold())
-        except Exception as e:
-            log(f"Topic notice for '{name}': {e}", "dim")
-
-        def tdir(topic_id, sub):
-            tname = safe_name(topics.get(topic_id, "General / No Topic"))
-            subname = safe_name(sub)
-            return cdir / tname / subname
+            flatten_course_folder(cdir)
+        except Exception as exc:
+            self.issue(cid, f"{name}: existing folders", f"Could not simplify the old folders. {explain_error(exc)}")
 
         refs = []
         links = []
         pending_folders = []
-        post_paths = {}
-
-        def post_dir(item):
-            path = tdir(item.get("topicId"), item.get("title", "Untitled post"))
-            key = str(path).casefold()
-            if key in post_paths and post_paths[key] != item.get("id"):
-                path = path.with_name(path.name + " [" + str(item.get("id", ""))[-10:] + "]")
-            post_paths[key] = item.get("id")
-            return path
 
         def add_url(url, d, title, kind="link"):
             url = html.unescape(str(url or "")).rstrip(".,;)>]}")
@@ -694,7 +808,7 @@ class Downloader:
 
         # 1. Scan Coursework Materials (Lecture Notes, Slides & Handouts)
         if self.options.get("include_materials", True):
-            add_materials(course.get("materials"), cdir / "_course_materials")
+            add_materials(course.get("materials"), cdir)
             try:
                 for item in paginate(
                     classroom.courses().courseWorkMaterials().list,
@@ -703,7 +817,7 @@ class Downloader:
                     pageSize=50,
                 ):
                     title = item.get("title", "material")
-                    d = post_dir(item)
+                    d = cdir
                     add_materials(item.get("materials"), d)
                     desc = item.get("description", "") or ""
                     if desc:
@@ -723,7 +837,7 @@ class Downloader:
                     pageSize=50,
                 ):
                     title = item.get("title", "assignment")
-                    d = post_dir(item)
+                    d = cdir
                     add_materials(item.get("materials"), d)
                     desc = item.get("description", "") or ""
                     if desc:
@@ -742,7 +856,7 @@ class Downloader:
                     courseId=cid,
                     pageSize=50,
                 ):
-                    d = cdir / "_announcements" / safe_name(item.get("creationTime", "")[:10] + " " + item.get("id", "announcement"))
+                    d = cdir
                     add_materials(item.get("materials"), d)
                     self.record_announcement(d, item)
                     ann_text = item.get("text", "") or ""
@@ -759,7 +873,6 @@ class Downloader:
         meta_cache = {}
         pending = [(fid, d, title, frozenset()) for fid, d, title in refs + pending_folders]
         seen = set()
-        folder_paths = {}
         failed_meta = {}
         while pending and not STOP.is_set():
             ids = [fid for fid, _, _, _ in pending if fid not in meta_cache and fid not in failed_meta]
@@ -767,13 +880,13 @@ class Downloader:
                 meta_cache.update(batch_metadata(self.api, ids, self.resource_keys, lambda fid, exc: failed_meta.update({fid: exc})))
             nxt = []
             for fid, d, title, ancestors in pending:
+                if fid in ancestors:
+                    self.issue(cid, title, "Folder or shortcut points back to an ancestor. Repeated traversal stopped.", f"https://drive.google.com/open?id={fid}")
+                    continue
                 key = (fid, str(d).casefold())
                 if key in seen:
                     continue
                 seen.add(key)
-                if fid in ancestors:
-                    self.issue(cid, title, "Folder or shortcut points back to an ancestor. Repeated traversal stopped.", f"https://drive.google.com/open?id={fid}")
-                    continue
                 meta = meta_cache.get(fid)
                 if not meta:
                     self.issue(cid, title or d.name, explain_error(failed_meta.get(fid, RuntimeError('File information is unavailable.'))), f"https://drive.google.com/open?id={fid}")
@@ -795,14 +908,9 @@ class Downloader:
                     continue
 
                 if meta.get("mimeType") == "application/vnd.google-apps.folder":
-                    sub = d / safe_name(meta.get("name") or title or "folder")
-                    path_key = str(sub).casefold()
-                    if path_key in folder_paths and folder_paths[path_key] != fid:
-                        sub = sub.with_name(sub.name + f" [{fid[-10:]}]")
-                    folder_paths[path_key] = fid
                     for ch in self.list_folder(fid, cid, meta.get("name", title)):
                         meta_cache[ch["id"]] = ch
-                        nxt.append((ch["id"], sub, ch.get("name", ""), ancestors | {fid}))
+                        nxt.append((ch["id"], cdir, ch.get("name", ""), ancestors | {fid}))
                 else:
                     files[key] = {"fid": fid, "dir": d, "title": title, "meta": meta}
             pending = nxt

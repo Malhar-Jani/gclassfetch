@@ -17,7 +17,7 @@ Google Classroom doesn't have a button to download all course files. Professors 
 - Google Drive files and folder links shared in post descriptions
 - Auto-exports Google Docs, Sheets, Slides, and Drawings to `.docx`, `.xlsx`, `.pptx`, and `.pdf`
 - Generates a local `index.html` file in your download directory to browse all files offline
-- Searches the offline library by course, topic, post title, or filename
+- Searches the offline library by course or filename
 - Verifies existing downloads using source metadata and content checksums
 - Reports inaccessible files, incomplete scans, and online-only resources separately
 - Includes archived courses when you choose **Include archived**
@@ -26,31 +26,27 @@ Google Classroom doesn't have a button to download all course files. Professors 
 
 ## Folder layout
 
-Files are organized by subject, topic, and post title:
+Each course gets one folder, with its files directly inside. Shared Drive folders are scanned fully without copying their folder nesting.
 
 ```text
 Classroom/
-├── index.html                   (offline browser viewer)
+├── index.html
+├── download-report.json
 ├── Machine Learning/
-│   ├── General/
-│   │   └── Syllabus/
-│   │       ├── syllabus.pdf
-│   │       └── links.txt
-│   ├── Week 1 - Linear Regression/
-│   │   ├── Lecture Notes/
-│   │   │   ├── slides.pptx
-│   │   │   └── practice.pdf
-│   │   └── Assignment 1/
-│   │       ├── homework.docx
-│   │       └── description.txt
-│   └── _announcements/
-│       ├── announcements.txt
-│       └── exam_date.pdf
+│   ├── syllabus.pdf
+│   ├── lecture_01.pptx
+│   ├── homework.docx
+│   ├── Classroom notes.txt
+│   ├── Classroom announcements.txt
+│   └── Classroom links.txt
 └── Data Structures/
-    └── Trees/
-        ├── lecture_tree.pdf
-        └── links.txt
+    ├── trees.pdf
+    └── practice.pdf
 ```
+
+Notes, announcements, and links are combined per course, rather than creating folders for individual posts. The same Drive attachment is saved once per course. Different files sharing a filename are kept with a numbered suffix.
+
+When a course already contains the older nested layout, the app moves its files directly into the course folder. It preserves distinct files, merges the old text digests, and removes only empty directories. Original text and file records plus a journal of attachment moves are kept in the hidden `.gclassfetch-backups` folder. Download bookkeeping is hidden in Windows Explorer.
 
 ---
 
@@ -105,9 +101,9 @@ Your browser will open `http://localhost:5328`. Sign in with your Google account
 
 When it finishes, the summary separates newly saved files, verified existing files, online links, and anything that needs attention. **Retry affected courses** checks those courses again and reuses verified downloads. A `download-report.json` is saved in the destination after each run. Reports include local paths and course information; keep them private.
 
-Open `index.html` in your download folder to browse course → topic → post without running the app. Search also finds filenames and file extensions. Repeated runs do not repeat the same description or link entry. Different posts with the same title and different files with the same filename are kept distinct.
+Open `index.html` in your download folder to browse each course’s files without running the app. Search also finds filenames and file extensions. Repeated runs do not repeat the same description or link entry. Attachments stay in the course folder, even when posts share a title. Different files with the same filename are kept distinct.
 
-Existing downloads made by older versions are reused when their checksum matches Google's original. If an old file cannot be verified, it is preserved and a new copy is saved. Changed documents are also saved as new copies so an earlier download is never overwritten. The hidden `.gclassfetch.json` in each post folder tracks verified files; keep it with your downloads.
+Existing downloads made by older versions are reused when their checksum matches Google's original. If an old file cannot be verified, it is preserved and a new copy is saved. Changed documents are also saved as new copies so an earlier download is never overwritten. The hidden `.gclassfetch.json` in each course folder tracks verified files; keep it with your downloads.
 
 Google Forms, videos, websites, and other online resources are recorded as links rather than offline copies. Files deleted by their owner, inaccessible to your account, blocked from downloading, or beyond Google's export limits appear in the review. The app cannot bypass those restrictions.
 
