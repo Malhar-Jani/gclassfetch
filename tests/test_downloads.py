@@ -1,0 +1,257 @@
+import copy
+import hashlib
+import json
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import app
+
+
+class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.original = copy.deepcopy(app.state)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        app.STOP.clear()
+        app.state.update(total_files=0, done_files=0, failed_files=0, skipped_files=0,
+                         total_bytes=0, done_bytes=0, issues=[], linked_files=0,
+                         courses={'c': dict(name='Course', status='scanning', total=0, done=0, failed=0)})
+        self.dl = app.Downloader(None, workers=4)
+
+    def tearDown(self):
+        self.dl.dl_pool.shutdown(wait=True)
+        app.state.clear()
+        app.state.update(self.original)
+        app.STOP.clear()
+        self.tmp.cleanup()
+
+    def item(self, fid='a', body=b'abc', name='notes.pdf'):
+        return dict(fid=fid, dir=self.root, title=name, cid='c', meta=dict(
+            id=fid, name=name, mimeType='application/pdf', size=str(len(body)),
+            modifiedTime='v1', md5Checksum=hashlib.md5(body).hexdigest()))
+
+    def transfer(self, factory, fh):
+        req = factory()
+        fh.write(req.body)
+        self.dl.bump_bytes(len(req.body))
+        return len(req.body)
+
+    def setup_media(self, contents):
+        drive = MagicMock()
+        drive.files.return_value.get_media.side_effect = lambda fileId, **kw: SimpleNamespace(body=contents[fileId], headers={})
+        self.dl.api = SimpleNamespace(drive=drive)
+        self.dl.transfer = self.transfer
+
+    def scan_setup(self, materials):
+        classroom = MagicMock()
+        classroom.courses.return_value.topics.return_value.list.return_value.execute.return_value = {'topic': []}
+        classroom.courses.return_value.courseWorkMaterials.return_value.list.return_value.execute.return_value = {'courseWorkMaterial': materials}
+        classroom.courses.return_value.courseWork.return_value.list.return_value.execute.return_value = {'courseWork': []}
+        classroom.courses.return_value.announcements.return_value.list.return_value.execute.return_value = {'announcements': []}
+        self.dl.api = SimpleNamespace(classroom=classroom)
+        return classroom
+
+    def test_drive_url_variants(self):
+        urls = [
+            ('https://drive.google.com/uc?export=download&id=abc', ('abc', 'file')),
+            ('https://drive.google.com/open?usp=sharing&id=abc', ('abc', 'file')),
+            ('https://docs.google.com/presentation/u/1/d/abc/edit', ('abc', 'file')),
+            ('https://drive.google.com/drive/u/2/folders/abc?resourcekey=key', ('abc', 'folder')),
+            ('https://drive.google.com/folderview?usp=sharing&id=abc', ('abc', 'folder')),
+            ('https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2Fabc%2Fview', ('abc', 'file')),
+            ('https://drive.google.com.evil.test/file/d/abc', (None, None)),
+            ('https://example.com/?url=drive.google.com/file/d/abc', (None, None)),
+            ('https://docs.google.com/forms/d/e/published-id/viewform', (None, None)),
+            ('https://docs.google.com/presentation/d/e/published-id/pub', (None, None)),
+        ]
+        for url, expected in urls:
+            with self.subTest(url=url):
+                self.assertEqual(app.extract_drive_ref(url), expected)
+
+    def test_pagination_and_stop_does_not_break_course_refresh(self):
+        method = MagicMock()
+        method.return_value.execute.side_effect = [{'files': [1], 'nextPageToken': 'next'}, {'files': [2]}]
+        app.STOP.set()
+        self.assertEqual(app.paginate(method, 'files', cancel=False), [1, 2])
+        self.assertEqual(method.call_args.kwargs['pageToken'], 'next')
+
+    def test_batch_item_failure_is_retried_and_reported(self):
+        api = MagicMock()
+        def make_batch(callback):
+            batch = MagicMock()
+            batch.execute.side_effect = lambda: [callback('ok', {'id': 'ok'}, None), callback('bad', None, ValueError('denied'))]
+            return batch
+        api.drive.new_batch_http_request.side_effect = make_batch
+        api.drive.files.return_value.get.return_value.execute.side_effect = ValueError('still denied')
+        failures = []
+        result = app.batch_metadata(api, ['ok', 'bad'], {'bad': 'key'}, lambda fid, exc: failures.append(fid))
+        self.assertEqual(set(result), {'ok'})
+        self.assertEqual(failures, ['bad'])
+        self.assertEqual(api.drive.files.return_value.get.return_value.headers.__setitem__.call_args.args,
+                         ('X-Goog-Drive-Resource-Keys', 'bad/key'))
+
+    def test_different_files_same_name_and_size_are_both_saved(self):
+        self.setup_media({'a': b'abc', 'b': b'xyz'})
+        app.state['courses']['c']['total'] = 2
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(self.dl.download_one, [self.item('a', b'abc'), self.item('b', b'xyz')]))
+        files = list(self.root.glob('*.pdf'))
+        self.assertEqual({path.read_bytes() for path in files}, {b'abc', b'xyz'})
+        self.assertEqual(app.state['done_files'], 2)
+        self.assertEqual(app.state['skipped_files'], 0)
+
+    def test_repeat_and_changed_file_and_local_corruption(self):
+        self.setup_media({'a': b'abc'})
+        item = self.item()
+        self.dl.download_one(item)
+        self.dl.download_one(item)
+        self.assertEqual(app.state['skipped_files'], 1)
+        (self.root / 'notes.pdf').write_bytes(b'bad')
+        self.dl.download_one(item)
+        self.assertEqual(app.state['skipped_files'], 1)
+        changed = self.item('a', b'xyz')
+        changed['meta']['modifiedTime'] = 'v2'
+        self.setup_media({'a': b'xyz'})
+        self.dl.download_one(changed)
+        self.assertEqual(app.state['failed_files'], 0)
+        self.assertIn(b'xyz', [p.read_bytes() for p in self.root.glob('*.pdf')])
+
+    def test_empty_file_and_active_partial_are_safe(self):
+        partial = self.root / 'notes.pdf.part'
+        partial.write_bytes(b'active download')
+        self.setup_media({'a': b''})
+        self.dl.download_one(self.item(body=b''))
+        self.dl.download_one(self.item(body=b''))
+        self.assertEqual(partial.read_bytes(), b'active download')
+        self.assertEqual((self.root / 'notes.pdf').read_bytes(), b'')
+        self.assertEqual(app.state['skipped_files'], 1)
+
+    def test_wrong_content_is_not_committed(self):
+        self.setup_media({'a': b'bad'})
+        self.dl.download_one(self.item(body=b'abc'))
+        self.assertFalse(list(self.root.glob('*.pdf')))
+        self.assertFalse(list(self.root.glob('*.part')))
+        self.assertEqual(app.state['failed_files'], 1)
+        self.assertEqual(len(app.state['issues']), 1)
+        self.assertEqual(app.state['done_bytes'], 0)
+
+    def test_user_stop_is_not_reported_as_download_failure(self):
+        self.setup_media({'a':b'abc'})
+        def stop(factory, fh):
+            app.STOP.set()
+            raise app.DownloadFailed(RuntimeError('Stopped'),0)
+        self.dl.transfer = stop
+        self.dl.download_one(self.item())
+        self.assertEqual(app.state['failed_files'],0)
+        self.assertEqual(app.state['issues'],[])
+        self.assertEqual(self.dl.report[0]['status'],'stopped')
+        self.assertFalse(list(self.root.glob('*.part')))
+
+    def test_deep_folders_and_cycle_and_repeated_attachments(self):
+        self.scan_setup([{'id': 'post1', 'title': 'Notes', 'materials': [{'driveFile': {'driveFile': {'id': 'f0'}}}]},
+                         {'id': 'post2', 'title': 'Revision', 'materials': [{'driveFile': {'driveFile': {'id': 'leaf'}}}]}])
+        metas = {f'f{i}': dict(id=f'f{i}', name=f'Level {i}', mimeType='application/vnd.google-apps.folder') for i in range(11)}
+        metas['leaf'] = self.item('leaf')['meta']
+        metas['loop'] = dict(id='loop', name='Loop', mimeType='application/vnd.google-apps.shortcut', shortcutDetails={'targetId': 'f0'})
+        def folder(fid, *args):
+            return [metas[f'f{int(fid[1:]) + 1}']] if fid != 'f10' else [metas['leaf'], metas['loop']]
+        self.dl.list_folder = folder
+        with patch.object(app, 'batch_metadata', side_effect=lambda api, ids, *args: {fid: metas[fid] for fid in ids}):
+            result = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(any('Level 10' in str(item['dir']) for item in result))
+        self.assertTrue(any('ancestor' in issue['reason'] for issue in app.state['issues']))
+
+    def test_same_title_posts_do_not_merge_and_text_does_not_repeat(self):
+        posts = [{'id': id, 'title': 'Lecture', 'description': 'Read this', 'materials': [{'driveFile': {'id': 'file'}}]} for id in ['p1', 'p2']]
+        self.scan_setup(posts)
+        with patch.object(app, 'batch_metadata', return_value={'file': self.item('file')['meta']}):
+            first = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
+            self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
+        self.assertEqual(len({item['dir'] for item in first}), 2)
+        for item in first:
+            self.assertEqual((item['dir'] / 'description.txt').read_text().count('Read this'), 1)
+
+    def test_metadata_and_scan_failures_are_visible(self):
+        classroom = self.scan_setup([{'id': 'p', 'title': 'Notes', 'materials': [{'driveFile': {'id': 'missing'}}]}])
+        classroom.courses.return_value.announcements.return_value.list.return_value.execute.side_effect = ValueError('no access')
+        def missing(api, ids, keys, on_error):
+            on_error('missing', ValueError('file denied'))
+            return {}
+        with patch.object(app, 'batch_metadata', side_effect=missing):
+            result = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
+        self.assertEqual(result, [])
+        self.assertEqual(len(app.state['issues']), 2)
+        self.assertEqual(app.state['courses']['c']['status'], 'done-warnings')
+
+    def test_resource_key_reaches_metadata_and_download(self):
+        self.scan_setup([{'id': 'p', 'title': 'Notes', 'description': 'https://drive.google.com/open?usp=sharing&id=a&resourcekey=secret'}])
+        with patch.object(app, 'batch_metadata', return_value={'a': self.item()['meta']}) as batch:
+            self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
+            self.assertEqual(batch.call_args.args[2]['a'], 'secret')
+        self.setup_media({'a': b'abc'})
+        self.dl.download_one(self.item())
+        self.assertEqual(self.dl.headers('a'), {'X-Goog-Drive-Resource-Keys': 'a/secret'})
+
+    def test_offline_index_escapes_names_and_encodes_file_paths(self):
+        directory = self.root / 'Course & one' / 'Topic' / 'Post'
+        directory.mkdir(parents=True)
+        (directory / 'a #1.pdf').write_bytes(b'pdf')
+        (directory / '.gclassfetch.json').write_text('{}')
+        app.generate_offline_index(self.root)
+        output = (self.root / 'index.html').read_text(encoding='utf-8')
+        self.assertIn('Course &amp; one', output)
+        self.assertIn('a%20%231.pdf', output)
+        self.assertNotIn('.gclassfetch.json', output)
+
+    def test_restricted_and_online_only_items_have_visible_outcomes(self):
+        self.scan_setup([{'id': 'p', 'title': 'Notes', 'materials': [
+            {'driveFile': {'id': 'restricted'}}, {'driveFile': {'id': 'form'}},
+            {'youtubeVideo': {'id': 'video-id', 'title': 'Recording'}}]}])
+        metas = {'restricted': dict(id='restricted', name='Read only.pdf', mimeType='application/pdf', capabilities={'canDownload':False}),
+                 'form': dict(id='form', name='Quiz', mimeType='application/vnd.google-apps.form')}
+        with patch.object(app, 'batch_metadata', return_value=metas):
+            items = self.dl.scan_course({'id':'c','name':'Course'},self.root)
+        self.assertEqual(items,[])
+        self.assertEqual(app.state['linked_files'],2)
+        self.assertEqual(len([i for i in app.state['issues'] if i['kind'] != 'link']),1)
+        self.assertEqual(app.state['courses']['c']['status'],'done-warnings')
+
+    def test_run_scan_failure_finishes_with_warning_and_report(self):
+        classroom = self.scan_setup([])
+        classroom.courses.return_value.list.return_value.execute.return_value = {'courses':[{'id':'c','name':'Course'}]}
+        app.state['running'] = True
+        with patch.object(self.dl,'scan_course',side_effect=ValueError('scan failed')), patch.object(app,'save_config'):
+            self.dl.run('all',str(self.root))
+        self.assertFalse(app.state['running'])
+        self.assertEqual(app.state['phase'],'done-warnings')
+        self.assertEqual(app.state['scan_done'],1)
+        report = json.loads((self.root/'download-report.json').read_text(encoding='utf-8'))
+        self.assertEqual(report['courses']['c']['status'],'error')
+        self.assertEqual(len(report['issues']),1)
+
+    def test_routes_validate_requests_and_keep_stopped_courses_refreshable(self):
+        client = app.app.test_client()
+        with patch.object(app,'get_current_credentials',return_value=object()), patch.object(app,'save_config'):
+            response = client.post('/start/c',json={'workers':'bad'})
+            self.assertEqual(response.status_code,400)
+            response = client.post('/start/c',json={'options':{'include_materials':False,'include_coursework':False,'include_announcements':False}})
+            self.assertEqual(response.status_code,400)
+            self.assertEqual(client.post('/config',json={'workers':'bad'}).status_code,400)
+            app.state['running'] = True
+            self.assertEqual(client.post('/start/c',json={}).status_code,409)
+        app.STOP.set()
+        classroom = MagicMock()
+        classroom.courses.return_value.list.return_value.execute.return_value={'courses':[{'id':'archived','name':'Past course','courseState':'ARCHIVED'}]}
+        with patch.object(app,'get_current_credentials',return_value=object()), patch.object(app,'build',return_value=classroom):
+            response = client.get('/courses?archived=true')
+            self.assertEqual(response.get_json()[0]['id'],'archived')
+            self.assertEqual(classroom.courses.return_value.list.call_args.kwargs['courseStates'],['ACTIVE','ARCHIVED'])
+
+
+if __name__ == '__main__':
+    unittest.main()

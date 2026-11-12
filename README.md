@@ -17,6 +17,10 @@ Google Classroom doesn't have a button to download all course files. Professors 
 - Google Drive files and folder links shared in post descriptions
 - Auto-exports Google Docs, Sheets, Slides, and Drawings to `.docx`, `.xlsx`, `.pptx`, and `.pdf`
 - Generates a local `index.html` file in your download directory to browse all files offline
+- Searches the offline library by course, topic, post title, or filename
+- Verifies existing downloads using source metadata and content checksums
+- Reports inaccessible files, incomplete scans, and online-only resources separately
+- Includes archived courses when you choose **Include archived**
 
 ---
 
@@ -52,7 +56,7 @@ Classroom/
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - A Google account enrolled in Classroom classes
 
 ---
@@ -97,7 +101,15 @@ For a full step-by-step walkthrough, see [SETUP.md](SETUP.md).
   ./run.sh
   ```
 
-Your browser will open `http://localhost:5328`. Sign in with your Google account, select your courses, and click **Fetch ALL Courses**.
+Your browser will open `http://localhost:5328`. Sign in with your Google account, select your courses, choose a destination, and click **Download courses**. Detailed options are under **Download settings**.
+
+When it finishes, the summary separates newly saved files, verified existing files, online links, and anything that needs attention. **Retry affected courses** checks those courses again and reuses verified downloads. A `download-report.json` is saved in the destination after each run. Reports include local paths and course information; keep them private.
+
+Open `index.html` in your download folder to browse course → topic → post without running the app. Search also finds filenames and file extensions. Repeated runs do not repeat the same description or link entry. Different posts with the same title and different files with the same filename are kept distinct.
+
+Existing downloads made by older versions are reused when their checksum matches Google's original. If an old file cannot be verified, it is preserved and a new copy is saved. Changed documents are also saved as new copies so an earlier download is never overwritten. The hidden `.gclassfetch.json` in each post folder tracks verified files; keep it with your downloads.
+
+Google Forms, videos, websites, and other online resources are recorded as links rather than offline copies. Files deleted by their owner, inaccessible to your account, blocked from downloading, or beyond Google's export limits appear in the review. The app cannot bypass those restrictions.
 
 ---
 
@@ -142,3 +154,9 @@ Double-click `setup_desktop_shortcut.bat` to add a `GClassFetch` shortcut to you
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## Development checks
+
+Run the download and route regression checks with `python -m unittest discover -s tests -v`.
+
+For browser interaction checks, install Playwright and Chromium in your development environment, run the local app, then run `node tests/ui_smoke.cjs`. If Playwright is installed elsewhere, set `PLAYWRIGHT_MODULE` to its module path. The browser checks use API fixtures, test 360px, 768px, and 1440px layouts, and do not download course content or change saved settings.

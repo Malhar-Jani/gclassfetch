@@ -38,3 +38,8 @@ desktop.ini
 .idea/
 *.sublime-workspace
 *.sublime-project
+
+# Local package builds
+build/
+dist/
+*.egg-info/

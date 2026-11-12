@@ -6,6 +6,7 @@
     "include_coursework": true,
     "include_announcements": true,
     "save_links": true,
-    "export_docs": true
+    "export_docs": true,
+    "create_index": true
   }
 }

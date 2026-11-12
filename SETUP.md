@@ -6,7 +6,7 @@ To download your files directly from Google without third-party servers, you cre
 
 ## Prerequisites
 
-- Python 3.8 or higher ([python.org](https://www.python.org/downloads/))
+- Python 3.9 or higher ([python.org](https://www.python.org/downloads/))
 - For Windows users: ensure "Add Python to PATH" is checked during Python installation.
 
 ---
