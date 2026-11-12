@@ -16,11 +16,11 @@ Existing Python/Flask app runs on localhost on Windows, with a command-line mode
 
 ## Capabilities and constraints
 
-Read materials, coursework, announcements, linked Drive folders and shortcuts. Export supported Google documents. Use one folder per course with files directly inside; provide an offline library. Distinguish actual downloads, verified existing files, online resources, and incomplete scans. Owner restrictions and unsupported online content must be explained truthfully.
+Read materials, coursework, announcements, linked Drive folders and shortcuts. Export supported Google documents. Group files by course and Classroom topic, with files directly inside each topic; provide an offline library. Distinguish actual downloads, verified existing files, online resources, and incomplete scans. Owner restrictions and unsupported online content must be explained truthfully.
 
 ## Confirmed preferences
 
-No topic, post, date/ID, or shared-folder nesting. Collect text and links per course. Use a creamier, calmer interface with soft brown accents.
+Keep normal course/topic segregation. Use General for uncategorized materials, Assignments for uncategorized coursework, and one Announcements folder. No post, date/ID, or shared-folder nesting. Collect text and links per group. Use a creamier, calmer interface with soft brown accents.
 
 ## Product principles
 

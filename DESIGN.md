@@ -12,6 +12,6 @@ Use the requested warm cream surfaces, soft brown text and actions, restrained b
 
 ## Layout and behavior
 
-Desktop: course list is the main workspace, destination and primary action occupy a quiet side panel. Mobile: the course list comes first with the primary action fixed at the bottom, with all controls fitting at 360px. Courses are rows, not a wall of separate cards. Keep detailed transfer metrics inside Activity. Show saved, already saved, online links and attention as distinct outcomes. Keep one folder per course, with all attachments directly inside. The offline library shows only course-level groups followed by a flat file list. Do not add topic, post, date, or ID folders.
+Desktop: course list is the main workspace, destination and primary action occupy a quiet side panel. Mobile: the course list comes first with the primary action fixed at the bottom, with all controls fitting at 360px. Courses are rows, not a wall of separate cards. Keep detailed transfer metrics inside Activity. Show saved, already saved, online links and attention as distinct outcomes. Use course → Classroom topic → files. The offline library uses course disclosures with simple topic headings and file lists. Keep General, Assignments, and Announcements as fallbacks. Do not add post, date, ID, or shared Drive folder nesting.
 
 Use native checkboxes, labels, accessible disclosures, visible focus, inline errors, and reduced-motion support. Never rely on color alone to communicate state. Avoid external fonts and decorative assets in this local utility.

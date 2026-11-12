@@ -213,6 +213,13 @@ def hide_metadata(path):
             kernel.SetFileAttributesW(str(path), attributes | 2)
 
 
+def write_record(path, data):
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+    hide_metadata(path)
+
+
 def flatten_course_folder(course_dir):
     """Move legacy attachments into their course folder without overwriting files.
 
@@ -331,8 +338,7 @@ def flatten_course_folder(course_dir):
                 merged[fid] = entry
     if merged:
         manifest = course / ".gclassfetch.json"
-        manifest.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-        hide_metadata(manifest)
+        write_record(manifest, merged)
     for path in manifests:
         if path.parent != course:
             path.unlink()  # Original is preserved in the verified backup ZIP.
@@ -343,6 +349,20 @@ def flatten_course_folder(course_dir):
             pass
     log(f"Simplified {course.name}: {len(moves)} files moved into the course folder", "ok")
     return len(moves)
+
+
+def prepare_course_folder(course_dir):
+    """Keep category folders, removing only the old nesting inside each one."""
+    course = Path(course_dir)
+    if not course.is_dir():
+        return
+    for old_name, new_name in {"_announcements": "Announcements", "_course_materials": "General"}.items():
+        old, new = course / old_name, course / new_name
+        if old.is_dir() and not new.exists() and not old.is_symlink() and not getattr(old, "is_junction", lambda: False)():
+            os.rename(old, new)
+    for group in course.iterdir():
+        if group.is_dir() and not group.name.startswith("."):
+            flatten_course_folder(group)
 
 
 def explain_error(error):
@@ -444,7 +464,7 @@ def generate_offline_index(dest_dir):
         for course_dir in sorted(dest.iterdir()):
             if not course_dir.is_dir() or course_dir.name.startswith("."):
                 continue
-            files = []
+            groups = {}
             # Also read older nested layouts so existing libraries stay usable.
             for root, directories, filenames in os.walk(course_dir):
                 directories[:] = sorted(d for d in directories if not d.startswith("."))
@@ -452,13 +472,17 @@ def generate_offline_index(dest_dir):
                     if filename.startswith(".") or filename.endswith((".part", ".tmp")) or filename == "index.html":
                         continue
                     path = Path(root) / filename
-                    files.append({"name": filename,
+                    relative = path.relative_to(course_dir)
+                    group = relative.parts[0] if len(relative.parts) > 1 else "General"
+                    groups.setdefault(group, []).append({"name": filename,
                                   "url": quote(path.relative_to(dest).as_posix(), safe="/"),
                                   "ext": path.suffix.lower().lstrip(".") or "file"})
-            if files:
-                files.sort(key=lambda file: file["name"].casefold())
-                courses.append({"name": course_dir.name, "files": files, "count": len(files)})
-                total += len(files)
+            if groups:
+                for files in groups.values():
+                    files.sort(key=lambda file: file["name"].casefold())
+                count = sum(len(files) for files in groups.values())
+                courses.append({"name": course_dir.name, "groups": sorted(groups.items()), "count": count})
+                total += count
         with app.app_context():
             page = render_template("library.html", courses=courses, total=total,
                                    css=(UI_BASE / "static" / "app.css").read_text(encoding="utf-8"))
@@ -610,6 +634,39 @@ class Downloader:
             if known_name and Path(known_name).name == known_name and known.is_file() and entry.get("version") == version:
                 if file_digest(known) == entry.get("sha256"):
                     return known, None, version
+            # Reuse verified files saved by the brief flat-layout release. Move
+            # them into their topic without fetching another copy from Google.
+            course = item.get("course_dir")
+            if course and directory.resolve().parent == Path(course).resolve():
+                course = Path(course)
+                old_manifest = course / ".gclassfetch.json"
+                try:
+                    old_records = json.loads(old_manifest.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    old_records = {}
+                old_entry = old_records.get(item["fid"], {})
+                old_name = old_entry.get("filename", "")
+                old_file = course / old_name
+                if old_name and Path(old_name).name == old_name and old_file.is_file() and old_entry.get("version") == version and file_digest(old_file) == old_entry.get("sha256"):
+                    target = directory / old_name
+                    number = 1
+                    while target.exists() or str(target).casefold() in self.reserved_paths:
+                        target = directory / f"{Path(old_name).stem} ({number}){Path(old_name).suffix}"
+                        number += 1
+                    if old_file.resolve().parent != course.resolve() or not target.resolve().is_relative_to(course.resolve()):
+                        raise OSError("The saved file points outside this course folder.")
+                    journal = course / ".gclassfetch-moves.json"
+                    try:
+                        moves = json.loads(journal.read_text(encoding="utf-8"))
+                    except (ValueError, OSError):
+                        moves = []
+                    moves.append({"from": old_name, "to": target.relative_to(course).as_posix(), "sha256": old_entry["sha256"]})
+                    write_record(journal, moves)
+                    os.rename(old_file, target)
+                    self.commit_file(item, target, version)
+                    old_records.pop(item["fid"], None)
+                    write_record(old_manifest, old_records)
+                    return target, None, version
             candidate = directory / filename
             # Existing files from older versions are reusable only with Google's
             # actual content checksum, never merely their name or byte count.
@@ -755,9 +812,26 @@ class Downloader:
         cdir = base_dir / cname
 
         try:
-            flatten_course_folder(cdir)
+            prepare_course_folder(cdir)
         except Exception as exc:
             self.issue(cid, f"{name}: existing folders", f"Could not simplify the old folders. {explain_error(exc)}")
+
+        topics = {}
+        used_topic_names = set()
+        try:
+            for topic in paginate(classroom.courses().topics().list, "topic", courseId=cid):
+                base_name = safe_name(topic.get("name") or "General")
+                topic_name, number = base_name, 2
+                while topic_name.casefold() in used_topic_names:
+                    topic_name = f"{base_name} ({number})"
+                    number += 1
+                used_topic_names.add(topic_name.casefold())
+                topics[topic["topicId"]] = topic_name
+        except Exception as exc:
+            self.issue(cid, f"{name}: topics", f"Could not read topic names. Files will use General or Assignments. {explain_error(exc)}")
+
+        def group_dir(item, fallback="General"):
+            return cdir / topics.get(item.get("topicId"), fallback)
 
         refs = []
         links = []
@@ -808,7 +882,7 @@ class Downloader:
 
         # 1. Scan Coursework Materials (Lecture Notes, Slides & Handouts)
         if self.options.get("include_materials", True):
-            add_materials(course.get("materials"), cdir)
+            add_materials(course.get("materials"), cdir / "General")
             try:
                 for item in paginate(
                     classroom.courses().courseWorkMaterials().list,
@@ -817,7 +891,7 @@ class Downloader:
                     pageSize=50,
                 ):
                     title = item.get("title", "material")
-                    d = cdir
+                    d = group_dir(item)
                     add_materials(item.get("materials"), d)
                     desc = item.get("description", "") or ""
                     if desc:
@@ -837,7 +911,7 @@ class Downloader:
                     pageSize=50,
                 ):
                     title = item.get("title", "assignment")
-                    d = cdir
+                    d = group_dir(item, "Assignments")
                     add_materials(item.get("materials"), d)
                     desc = item.get("description", "") or ""
                     if desc:
@@ -856,7 +930,7 @@ class Downloader:
                     courseId=cid,
                     pageSize=50,
                 ):
-                    d = cdir
+                    d = cdir / "Announcements"
                     add_materials(item.get("materials"), d)
                     self.record_announcement(d, item)
                     ann_text = item.get("text", "") or ""
@@ -910,9 +984,9 @@ class Downloader:
                 if meta.get("mimeType") == "application/vnd.google-apps.folder":
                     for ch in self.list_folder(fid, cid, meta.get("name", title)):
                         meta_cache[ch["id"]] = ch
-                        nxt.append((ch["id"], cdir, ch.get("name", ""), ancestors | {fid}))
+                        nxt.append((ch["id"], d, ch.get("name", ""), ancestors | {fid}))
                 else:
-                    files[key] = {"fid": fid, "dir": d, "title": title, "meta": meta}
+                    files.setdefault(fid, {"fid": fid, "dir": d, "title": title, "meta": meta})
             pending = nxt
 
         items = []
@@ -955,6 +1029,7 @@ class Downloader:
                 "title": info["title"],
                 "meta": meta,
                 "cid": cid,
+                "course_dir": cdir,
             })
 
         with state_lock:

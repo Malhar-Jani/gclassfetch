@@ -18,7 +18,7 @@
     </header>
 
     <main>
-      <div class="page-heading"><div><h1>Download your courses.</h1><p>Choose your courses. Keep their files in one simple folder each.</p></div></div>
+      <div class="page-heading"><div><h1>Download your courses.</h1><p>Choose your courses. Keep notes and assignments grouped by topic.</p></div></div>
       <div id="notice" class="notice hidden" role="alert"></div>
 
       {% if need_auth %}
@@ -39,7 +39,7 @@
           <p class="selection-summary" id="selectionSummary">Choose the courses you want to keep.</p>
           <label class="field-label" for="destination">Save to</label>
           <div class="destination"><input id="destination" type="text" spellcheck="false" placeholder="Your Downloads / Classroom folder"><button class="button subtle" id="browseButton">Choose folder</button></div>
-          <p class="folder-hint">One folder per course. All its files directly inside.</p>
+          <p class="folder-hint">Course → topic → files. No extra post folders.</p>
           <button class="button primary download-button" id="downloadButton" disabled>Choose courses to download</button>
           <p class="reassurance">Repeat downloads check saved files first.</p>
           <details class="settings" id="settings"><summary>Download settings</summary>

@@ -163,8 +163,8 @@ class DownloadTests(unittest.TestCase):
         with patch.object(app, 'batch_metadata', side_effect=lambda api, ids, *args: {fid: metas[fid] for fid in ids}):
             result = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]['dir'], self.root / 'Course')
-        self.assertFalse(any(p.is_dir() for p in (self.root / 'Course').iterdir()))
+        self.assertEqual(result[0]['dir'], self.root / 'Course' / 'General')
+        self.assertFalse(any(p.is_dir() for p in result[0]['dir'].iterdir()))
         self.assertTrue(any('ancestor' in issue['reason'] for issue in app.state['issues']))
 
     def test_repeated_attachments_save_once_and_post_text_is_aggregated(self):
@@ -174,10 +174,10 @@ class DownloadTests(unittest.TestCase):
             first = self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
             self.dl.scan_course({'id': 'c', 'name': 'Course'}, self.root)
         self.assertEqual(len(first), 1)
-        self.assertEqual(first[0]['dir'], self.root / 'Course')
+        self.assertEqual(first[0]['dir'], self.root / 'Course' / 'General')
         self.assertEqual((first[0]['dir'] / 'Classroom notes.txt').read_text().count('Read this'), 1)
 
-    def test_announcements_save_directly_in_course_without_id_folders(self):
+    def test_announcements_share_one_folder_without_id_folders(self):
         classroom = self.scan_setup([])
         classroom.courses.return_value.announcements.return_value.list.return_value.execute.return_value = {'announcements':[
             {'id':'12345','creationTime':'2026-11-12T10:00:00Z','text':'Read chapter 1', 'materials':[{'driveFile':{'id':'a'}}]},
@@ -185,11 +185,11 @@ class DownloadTests(unittest.TestCase):
         with patch.object(app,'batch_metadata',return_value={'a':self.item('a')['meta'],'b':self.item('b')['meta']}):
             result = self.dl.scan_course({'id':'c','name':'Course'},self.root)
         self.assertEqual(len(result),2)
-        self.assertTrue(all(item['dir']==self.root/'Course' for item in result))
-        text=(self.root/'Course'/'Classroom announcements.txt').read_text()
+        self.assertTrue(all(item['dir']==self.root/'Course'/'Announcements' for item in result))
+        text=(self.root/'Course'/'Announcements'/'Classroom announcements.txt').read_text()
         self.assertIn('Read chapter 1',text)
         self.assertIn('Read chapter 2',text)
-        self.assertFalse(any(p.is_dir() for p in (self.root/'Course').iterdir()))
+        self.assertFalse(any(p.is_dir() for p in (self.root/'Course'/'Announcements').iterdir()))
 
     def test_flatten_legacy_folders_preserves_files_and_repeat_download_records(self):
         course=self.root/'Course'
@@ -224,11 +224,47 @@ class DownloadTests(unittest.TestCase):
 
     def test_cleanup_problem_does_not_prevent_finding_new_materials(self):
         self.scan_setup([{'id':'p','title':'Notes','materials':[{'driveFile':{'id':'a'}}]}])
-        with patch.object(app,'flatten_course_folder',side_effect=OSError('Unfinished old download')), patch.object(app,'batch_metadata',return_value={'a':self.item()['meta']}):
+        with patch.object(app,'prepare_course_folder',side_effect=OSError('Unfinished old download')), patch.object(app,'batch_metadata',return_value={'a':self.item()['meta']}):
             result=self.dl.scan_course({'id':'c','name':'Course'},self.root)
         self.assertEqual(len(result),1)
-        self.assertEqual(result[0]['dir'],self.root/'Course')
+        self.assertEqual(result[0]['dir'],self.root/'Course'/'General')
         self.assertTrue(any('old folders' in issue['reason'] for issue in app.state['issues']))
+
+    def test_classroom_topics_are_kept_without_post_folders(self):
+        classroom=self.scan_setup([
+            {'id':'p1','title':'Lecture 1','topicId':'t1','materials':[{'driveFile':{'id':'a'}}]},
+            {'id':'p2','title':'Lecture 2','topicId':'t1','materials':[{'driveFile':{'id':'b'}}]},
+            {'id':'p3','title':'Practice','topicId':'t2','materials':[{'driveFile':{'id':'d'}}]}])
+        classroom.courses.return_value.topics.return_value.list.return_value.execute.return_value={'topic':[
+            {'topicId':'t1','name':'Class Notes'},{'topicId':'t2','name':'Tutorial Sheets'}]}
+        classroom.courses.return_value.courseWork.return_value.list.return_value.execute.return_value={'courseWork':[
+            {'id':'a1','title':'Assignment 1','materials':[{'driveFile':{'id':'e'}}]}]}
+        with patch.object(app,'batch_metadata',return_value={fid:self.item(fid)['meta'] for fid in ['a','b','d','e']}):
+            result=self.dl.scan_course({'id':'c','name':'Course'},self.root)
+        paths={item['fid']:item['dir'].relative_to(self.root).as_posix() for item in result}
+        self.assertEqual(paths,{'a':'Course/Class Notes','b':'Course/Class Notes','d':'Course/Tutorial Sheets','e':'Course/Assignments'})
+        self.assertFalse(any('Lecture' in str(item['dir']) for item in result))
+
+    def test_old_post_nesting_is_removed_but_topic_folders_are_kept(self):
+        course=self.root/'Course';post=course/'Class Notes'/'Lecture 1';post.mkdir(parents=True)
+        (post/'lecture.pdf').write_bytes(b'lecture')
+        app.prepare_course_folder(course)
+        self.assertEqual((course/'Class Notes'/'lecture.pdf').read_bytes(),b'lecture')
+        self.assertFalse(post.exists())
+        app.prepare_course_folder(course)
+        self.assertTrue((course/'Class Notes'/'lecture.pdf').is_file())
+
+    def test_flat_release_file_moves_to_topic_without_another_download(self):
+        self.setup_media({'a':b'abc'})
+        item=self.item()
+        self.dl.download_one(item)
+        grouped={**item,'course_dir':self.root,'dir':self.root/'Class Notes'}
+        self.dl.download_one(grouped)
+        self.assertFalse((self.root/'notes.pdf').exists())
+        self.assertEqual((self.root/'Class Notes'/'notes.pdf').read_bytes(),b'abc')
+        self.assertEqual(app.state['skipped_files'],1)
+        self.assertEqual(app.state['failed_files'],0)
+        self.assertEqual(json.loads((self.root/'.gclassfetch-moves.json').read_text())[0]['to'],'Class Notes/notes.pdf')
 
     def test_metadata_and_scan_failures_are_visible(self):
         classroom = self.scan_setup([{'id': 'p', 'title': 'Notes', 'materials': [{'driveFile': {'id': 'missing'}}]}])
